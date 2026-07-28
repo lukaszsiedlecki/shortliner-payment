@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shortliner-payment
+  namespace: shortliner
+  labels:
+    app: shortliner-payment
+spec:
+  # Multiple replicas on purpose: this service's whole point is to be safe
+  # under concurrent requests hitting different instances. RollingUpdate
+  # (the default) is fine, unlike shortliner-analytics' Recreate — there's
+  # no in-memory dedup state here that a second instance could conflict with.
+  replicas: 2
+  selector:
+    matchLabels:
+      app: shortliner-payment
+  template:
+    metadata:
+      labels:
+        app: shortliner-payment
+    spec:
+      serviceAccountName: shortliner-payment
+      nodeSelector:
+        cloud.google.com/gke-spot: "true"
+      tolerations:
+        - key: cloud.google.com/gke-spot
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+        fsGroup: 1000
+        runAsUser: 1000
+        runAsGroup: 1000
+      containers:
+        - name: shortliner-payment
+          # Patched by .github/workflows/deploy.yml on every push to master
+          # — never edited by hand.
+          image: ghcr.io/lukaszsiedlecki/shortliner-payment:latest
+          ports:
+            - containerPort: 8083
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: false
+          env:
+            - name: JAVA_TOOL_OPTIONS
+              value: "-XX:MaxRAMPercentage=75.0"
+            # DB_HOST matches the other shortliner-* deployments: a plain
+            # (non-secret) value, not sourced from the Secret.
+            - name: DB_HOST
+              value: "192.168.0.78"
+            - name: DB_NAME
+              value: "shortliner_payment"
+            - name: DB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: shortliner-payment-db-secret
+                  key: DB_USER
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: shortliner-payment-db-secret
+                  key: DB_PASSWORD
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: "my-cluster-kafka-bootstrap.kafka.svc.cluster.local:9092"
+            - name: PAYMENT_DEBUG_ENABLED
+              value: "false"
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: 8083
+            initialDelaySeconds: 30
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8083
+            initialDelaySeconds: 60
