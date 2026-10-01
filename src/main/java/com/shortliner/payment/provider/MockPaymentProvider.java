@@ -42,7 +42,7 @@ public class MockPaymentProvider implements PaymentProvider {
     public ChargeResult charge(String idempotencyKey, BigDecimal amount, String currency) {
         ChargeResult cached = ledger.get(idempotencyKey);
         if (cached != null) {
-            log.debug("Provider already has a result for idempotency key {}, replaying it", idempotencyKey);
+            log.debug("Provider already has a result for this idempotency key, replaying it");
             return cached;
         }
 

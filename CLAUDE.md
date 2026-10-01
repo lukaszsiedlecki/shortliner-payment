@@ -62,11 +62,15 @@ reproduce this scenario by hand.
 
 **Outbox publishing** (`OutboxPublisher`, `@Scheduled`): polls PENDING outbox rows with a native
 `FOR UPDATE SKIP LOCKED` query, so multiple replicas' schedulers never publish the same event twice
-and never block on each other.
+and never block on each other. Each send's broker ack is awaited (one shared deadline per batch,
+`payment.outbox.send-timeout-ms`) before its row is marked PUBLISHED; unacked rows stay PENDING and
+are retried (at-least-once). `OutboxBacklogMetrics` exposes pending-count / oldest-age gauges from a
+cached snapshot refreshed on its own schedule, so they keep moving even while the publisher is stuck.
 
 **Spring's default `@Scheduled` pool is a single thread** shared by every scheduled method in the
-app — `spring.task.scheduling.pool.size=2` is set explicitly so `OutboxPublisher` blocking on a
-slow/unreachable Kafka broker can't starve `ReconciliationJob` of ever running. Found this by
+app — `spring.task.scheduling.pool.size=3` (one per scheduled job) is set explicitly so
+`OutboxPublisher` blocking on a slow/unreachable Kafka broker can't starve `ReconciliationJob` or
+`OutboxBacklogMetrics` of ever running. Found this by
 actually running the app against a broker-less environment during development, not by inspection.
 
 **Mock provider** (`MockPaymentProvider`): keeps its own in-memory ledger keyed by idempotency key,

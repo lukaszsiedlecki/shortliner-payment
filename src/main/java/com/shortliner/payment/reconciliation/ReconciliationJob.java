@@ -56,20 +56,24 @@ public class ReconciliationJob {
         if (stuck.isEmpty()) {
             return;
         }
-        log.info("Reconciliation found {} stuck PENDING payment(s)", stuck.size());
+        log.atInfo().addKeyValue("count", stuck.size()).log("Reconciliation found stuck PENDING payments");
         stuck.forEach(this::reconcileOne);
     }
 
     private void reconcileOne(Payment payment) {
         ChargeResult result = paymentProvider.checkStatus(payment.getIdempotencyKey());
         if (result == null) {
-            log.warn("Provider has no record for idempotency key {}, leaving payment {} PENDING for now",
-                    payment.getIdempotencyKey(), payment.getId());
+            log.atWarn()
+                    .addKeyValue("paymentId", payment.getId())
+                    .log("Provider has no record of this payment, leaving it PENDING for now");
             return;
         }
 
         paymentService.finalizePayment(payment.getId(), result);
         metrics.reconciliationResolved();
-        log.info("Reconciled payment {} to {}", payment.getId(), result.success() ? "SUCCESS" : "FAILED");
+        log.atInfo()
+                .addKeyValue("paymentId", payment.getId())
+                .addKeyValue("status", result.success() ? PaymentStatus.SUCCESS : PaymentStatus.FAILED)
+                .log("Reconciled stuck payment");
     }
 }

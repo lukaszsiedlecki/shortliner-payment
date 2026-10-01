@@ -1,5 +1,6 @@
 package com.shortliner.payment.payment.service;
 
+import com.shortliner.payment.metrics.ChargeOutcome;
 import com.shortliner.payment.metrics.PaymentMetrics;
 import com.shortliner.payment.payment.PaymentStatus;
 import com.shortliner.payment.payment.entity.Payment;
@@ -63,8 +64,24 @@ class PaymentServiceTest {
 
         assertThat(result.getStatus()).isEqualTo(PaymentStatus.SUCCESS);
         verify(metrics).chargeAttempted();
+        verify(metrics).chargeCompleted(eq(ChargeOutcome.SUCCESS), any());
         verify(paymentProvider).charge("key-1", BigDecimal.TEN, "USD");
         verify(transactionalOperations).finalizePayment(eq(id), any());
+    }
+
+    @Test
+    void recordsProviderErrorOutcomeAndRethrows() {
+        Payment pending = new Payment("key-3", BigDecimal.TEN, "USD");
+        ReflectionTestUtils.setField(pending, "id", UUID.randomUUID());
+
+        when(transactionalOperations.getOrCreatePending("key-3", BigDecimal.TEN, "USD")).thenReturn(pending);
+        when(paymentProvider.charge("key-3", BigDecimal.TEN, "USD")).thenThrow(new IllegalStateException("gateway down"));
+
+        assertThatThrownBy(() -> paymentService.charge("key-3", BigDecimal.TEN, "USD"))
+                .isInstanceOf(IllegalStateException.class);
+
+        verify(metrics).chargeCompleted(eq(ChargeOutcome.ERROR), any());
+        verify(transactionalOperations, never()).finalizePayment(any(), any());
     }
 
     @Test

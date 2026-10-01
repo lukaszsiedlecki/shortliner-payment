@@ -29,6 +29,7 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 import java.math.BigDecimal;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -40,6 +41,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 /**
  * Runs against a real Postgres (via Testcontainers) rather than H2 because
@@ -127,6 +129,9 @@ class PaymentConcurrencyIT {
         for (int i = 0; i < eventCount; i++) {
             outboxEventRepository.save(new OutboxEvent(UUID.randomUUID(), "PaymentCompleted", "{}"));
         }
+        // The publisher awaits each send's broker ack before marking a row.
+        when(kafkaTemplate.send(anyString(), anyString(), anyString()))
+                .thenReturn(CompletableFuture.completedFuture(null));
 
         // Simulates two replicas' schedulers firing at the same time.
         CountDownLatch start = new CountDownLatch(1);

@@ -70,8 +70,10 @@ class PaymentTransactionalOperations {
             return payment;
         } catch (DataIntegrityViolationException e) {
             return paymentRepository.findByIdempotencyKey(idempotencyKey)
+                    // Key deliberately left out of the message: it'd end up in
+                    // the ERROR log line GlobalExceptionHandler writes.
                     .orElseThrow(() -> new IllegalStateException(
-                            "Idempotency key " + idempotencyKey + " hit a unique violation but no row was found", e));
+                            "Idempotency key hit a unique violation but no row was found", e));
         }
     }
 
@@ -89,7 +91,10 @@ class PaymentTransactionalOperations {
                 .orElseThrow(() -> new PaymentNotFoundException(paymentId));
 
         if (payment.getStatus() != PaymentStatus.PENDING) {
-            log.debug("Payment {} already finalized as {}, nothing to do", paymentId, payment.getStatus());
+            log.atDebug()
+                    .addKeyValue("paymentId", paymentId)
+                    .addKeyValue("status", payment.getStatus())
+                    .log("Payment already finalized, nothing to do");
             return payment;
         }
 

@@ -1,5 +1,6 @@
 package com.shortliner.payment.payment.service;
 
+import com.shortliner.payment.metrics.ChargeOutcome;
 import com.shortliner.payment.metrics.PaymentMetrics;
 import com.shortliner.payment.payment.PaymentStatus;
 import com.shortliner.payment.payment.entity.Payment;
@@ -13,6 +14,7 @@ import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
+import java.time.Duration;
 import java.util.UUID;
 
 /**
@@ -49,12 +51,27 @@ public class PaymentService {
         if (payment.getStatus() != PaymentStatus.PENDING) {
             // Idempotent replay: a previous attempt (maybe on another
             // replica) already ran this to completion. Nothing to charge.
-            log.debug("Idempotency key {} already resolved to {}, skipping charge", idempotencyKey, payment.getStatus());
+            log.atDebug()
+                    .addKeyValue("paymentId", payment.getId())
+                    .addKeyValue("status", payment.getStatus())
+                    .log("Idempotent replay of an already resolved payment, skipping charge");
             return payment;
         }
 
-        ChargeResult result = paymentProvider.charge(idempotencyKey, amount, currency);
+        ChargeResult result = chargeProvider(idempotencyKey, amount, currency);
         return finalizePayment(payment.getId(), result);
+    }
+
+    private ChargeResult chargeProvider(String idempotencyKey, BigDecimal amount, String currency) {
+        long start = System.nanoTime();
+        try {
+            ChargeResult result = paymentProvider.charge(idempotencyKey, amount, currency);
+            metrics.chargeCompleted(ChargeOutcome.of(result), Duration.ofNanos(System.nanoTime() - start));
+            return result;
+        } catch (RuntimeException e) {
+            metrics.chargeCompleted(ChargeOutcome.of(e), Duration.ofNanos(System.nanoTime() - start));
+            throw e;
+        }
     }
 
     public Payment getById(UUID id) {
@@ -75,7 +92,7 @@ public class PaymentService {
         try {
             return transactionalOperations.finalizePayment(paymentId, result);
         } catch (ObjectOptimisticLockingFailureException e) {
-            log.debug("Payment {} was finalized concurrently, using the winning version", paymentId);
+            log.atDebug().addKeyValue("paymentId", paymentId).log("Payment was finalized concurrently, using the winning version");
             return paymentRepository.findById(paymentId).orElseThrow(() -> new PaymentNotFoundException(paymentId));
         }
     }
