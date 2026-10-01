@@ -1,5 +1,6 @@
 package com.shortliner.payment.payment.exception;
 
+import com.shortliner.payment.config.SecurityConfig;
 import com.shortliner.payment.payment.controller.PaymentController;
 import com.shortliner.payment.payment.service.PaymentService;
 import org.junit.jupiter.api.Test;
@@ -8,11 +9,13 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
+import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.jwt;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -20,6 +23,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 @WebMvcTest(PaymentController.class)
+@Import(SecurityConfig.class)
 @ExtendWith(OutputCaptureExtension.class)
 class GlobalExceptionHandlerTest {
 
@@ -31,7 +35,7 @@ class GlobalExceptionHandlerTest {
 
     @Test
     void unknownPathIs404WithoutErrorLog(CapturedOutput output) throws Exception {
-        mockMvc.perform(get("/does-not-exist"))
+        mockMvc.perform(get("/does-not-exist").with(jwt()))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.status").value(404));
 
@@ -40,17 +44,24 @@ class GlobalExceptionHandlerTest {
 
     @Test
     void unsupportedMethodIs405() throws Exception {
-        mockMvc.perform(delete("/api/payments"))
+        mockMvc.perform(delete("/api/payments").with(jwt()))
                 .andExpect(status().isMethodNotAllowed());
     }
 
     @Test
     void malformedBodyIs400WithoutEchoingIt() throws Exception {
         mockMvc.perform(post("/api/payments")
+                        .with(jwt())
                         .header("Idempotency-Key", "k")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"amount\": secret-garbage"))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.detail").value("Malformed request body"));
+    }
+
+    @Test
+    void outOfRangePageSizeIs400() throws Exception {
+        mockMvc.perform(get("/api/payments").param("size", "1000").with(jwt()))
+                .andExpect(status().isBadRequest());
     }
 }

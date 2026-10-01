@@ -24,6 +24,10 @@ import java.util.List;
  * progress lives in JVM memory, any replica picking up the sweep can resolve
  * any stuck row; ownership of a particular payment was never pinned to the
  * instance that started it.
+ * <p>
+ * Runs on a scheduler thread with no security context, and must stay that
+ * way: it works on rows directly and never goes through the caller-scoped
+ * lookups in PaymentService.
  */
 @Component
 public class ReconciliationJob {
@@ -61,7 +65,8 @@ public class ReconciliationJob {
     }
 
     private void reconcileOne(Payment payment) {
-        ChargeResult result = paymentProvider.checkStatus(payment.getIdempotencyKey());
+        // Same key PaymentService charged the provider with.
+        ChargeResult result = paymentProvider.checkStatus(payment.getId().toString());
         if (result == null) {
             log.atWarn()
                     .addKeyValue("paymentId", payment.getId())

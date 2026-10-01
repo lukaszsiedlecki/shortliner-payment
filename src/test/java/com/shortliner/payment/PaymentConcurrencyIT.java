@@ -16,8 +16,12 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.security.oauth2.jwt.Jwt;
+import org.springframework.security.oauth2.jwt.JwtDecoder;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -27,7 +31,11 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 import java.math.BigDecimal;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -39,6 +47,7 @@ import java.util.stream.IntStream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -49,8 +58,10 @@ import static org.mockito.Mockito.when;
  * wrong in a way H2 wouldn't catch: a unique-constraint violation aborting
  * the current transaction, and FOR UPDATE SKIP LOCKED.
  * <p>
- * Kafka delivery isn't what either test is about, so KafkaTemplate is
- * mocked rather than pulling in a second Testcontainers module.
+ * Kafka delivery isn't what these tests are about, so KafkaTemplate is
+ * mocked rather than pulling in a second Testcontainers module. Keycloak
+ * isn't either: JwtDecoder is mocked so the bearer token string is simply
+ * the user ID, while the real security filter chain still runs.
  */
 @Testcontainers
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
@@ -72,6 +83,8 @@ class PaymentConcurrencyIT {
 
     @MockitoBean
     private KafkaTemplate<String, String> kafkaTemplate;
+    @MockitoBean
+    private JwtDecoder jwtDecoder;
 
     @Autowired
     private TestRestTemplate restTemplate;
@@ -88,6 +101,16 @@ class PaymentConcurrencyIT {
         paymentRepository.deleteAll();
     }
 
+    @BeforeEach
+    void tokenIsTheUserId() {
+        lenient().when(jwtDecoder.decode(anyString())).thenAnswer(inv -> {
+            String token = inv.getArgument(0);
+            return new Jwt(token, Instant.now(), Instant.now().plusSeconds(300),
+                    Map.of("alg", "none"),
+                    Map.of("sub", token, "realm_access", Map.of("roles", List.of("user"))));
+        });
+    }
+
     @Test
     void concurrentRequestsWithTheSameIdempotencyKeyProduceExactlyOnePayment() throws InterruptedException {
         String idempotencyKey = "concurrency-test-" + UUID.randomUUID();
@@ -100,7 +123,7 @@ class PaymentConcurrencyIT {
         List<Runnable> tasks = IntStream.range(0, concurrentRequests)
                 .<Runnable>mapToObj(i -> () -> {
                     awaitUninterruptibly(start);
-                    ResponseEntity<PaymentResponse> response = postPayment(idempotencyKey);
+                    ResponseEntity<PaymentResponse> response = postPayment("user-a", idempotencyKey);
                     if (response.getStatusCode().is2xxSuccessful()) {
                         successfulHttpCalls.incrementAndGet();
                     }
@@ -121,6 +144,60 @@ class PaymentConcurrencyIT {
         List<Payment> payments = paymentRepository.findAll();
         assertThat(payments).hasSize(1);
         assertThat(payments.get(0).getStatus()).isEqualTo(PaymentStatus.SUCCESS);
+        assertThat(payments.get(0).getUserId()).isEqualTo("user-a");
+
+        // The outbox event carries the owner, for whoever grants premium.
+        List<OutboxEvent> events = outboxEventRepository.findAll();
+        assertThat(events).hasSize(1);
+        assertThat(events.get(0).getPayload()).contains("\"userId\":\"user-a\"");
+    }
+
+    @Test
+    void sameIdempotencyKeyFromTwoUsersConcurrentlyCreatesTwoSeparatePayments() throws InterruptedException {
+        String idempotencyKey = "shared-key-" + UUID.randomUUID();
+        int requestsPerUser = 10;
+
+        ExecutorService executor = Executors.newFixedThreadPool(requestsPerUser * 2);
+        CountDownLatch start = new CountDownLatch(1);
+        Map<String, List<UUID>> idsByUser = Map.of(
+                "user-a", Collections.synchronizedList(new ArrayList<>()),
+                "user-b", Collections.synchronizedList(new ArrayList<>()));
+
+        idsByUser.forEach((user, ids) -> IntStream.range(0, requestsPerUser).forEach(i -> executor.execute(() -> {
+            awaitUninterruptibly(start);
+            ResponseEntity<PaymentResponse> response = postPayment(user, idempotencyKey);
+            if (response.getStatusCode().is2xxSuccessful()) {
+                ids.add(response.getBody().id());
+            }
+        })));
+        start.countDown();
+        executor.shutdown();
+        assertThat(executor.awaitTermination(30, TimeUnit.SECONDS)).isTrue();
+
+        // Within each user: every request resolved to that user's one payment.
+        // Across users: the shared key never made B read back A's row.
+        assertThat(idsByUser.get("user-a")).hasSize(requestsPerUser).containsOnly(idsByUser.get("user-a").get(0));
+        assertThat(idsByUser.get("user-b")).hasSize(requestsPerUser).containsOnly(idsByUser.get("user-b").get(0));
+        assertThat(idsByUser.get("user-a").get(0)).isNotEqualTo(idsByUser.get("user-b").get(0));
+
+        List<Payment> payments = paymentRepository.findAll();
+        assertThat(payments).hasSize(2);
+        assertThat(payments).extracting(Payment::getUserId).containsExactlyInAnyOrder("user-a", "user-b");
+        assertThat(payments).allMatch(p -> p.getStatus() == PaymentStatus.SUCCESS);
+    }
+
+    @Test
+    void anonymousIsRejectedAndOtherUsersPaymentIsNotFound() {
+        HttpHeaders noAuth = new HttpHeaders();
+        noAuth.set("Idempotency-Key", "k");
+        ResponseEntity<String> anonymous = restTemplate.postForEntity("/api/payments",
+                new HttpEntity<>(new PaymentRequest(BigDecimal.TEN, "USD"), noAuth), String.class);
+        assertThat(anonymous.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+
+        UUID paymentId = postPayment("user-a", "k-" + UUID.randomUUID()).getBody().id();
+
+        assertThat(getPayment("user-a", paymentId).getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(getPayment("user-b", paymentId).getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
     }
 
     @Test
@@ -155,11 +232,18 @@ class PaymentConcurrencyIT {
         verify(kafkaTemplate, times(eventCount)).send(anyString(), anyString(), anyString());
     }
 
-    private ResponseEntity<PaymentResponse> postPayment(String idempotencyKey) {
+    private ResponseEntity<PaymentResponse> postPayment(String userId, String idempotencyKey) {
         HttpHeaders headers = new HttpHeaders();
+        headers.setBearerAuth(userId);
         headers.set("Idempotency-Key", idempotencyKey);
         HttpEntity<PaymentRequest> entity = new HttpEntity<>(new PaymentRequest(BigDecimal.TEN, "USD"), headers);
         return restTemplate.postForEntity("/api/payments", entity, PaymentResponse.class);
+    }
+
+    private ResponseEntity<String> getPayment(String userId, UUID paymentId) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setBearerAuth(userId);
+        return restTemplate.exchange("/api/payments/" + paymentId, HttpMethod.GET, new HttpEntity<>(headers), String.class);
     }
 
     private static void awaitUninterruptibly(CountDownLatch latch) {

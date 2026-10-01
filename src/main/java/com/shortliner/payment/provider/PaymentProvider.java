@@ -6,6 +6,9 @@ import java.math.BigDecimal;
  * Stand-in for a real payment gateway (Stripe, Adyen, ...). Every real
  * gateway worth using accepts a client-provided idempotency key so retries of
  * the exact same charge don't double-bill — this interface mirrors that.
+ * <p>
+ * The key here is scoped to this whole service (our merchant account), so
+ * callers pass the payment ID, not a client's per-user idempotency key.
  */
 public interface PaymentProvider {
 

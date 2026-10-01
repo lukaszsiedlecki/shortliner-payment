@@ -11,23 +11,35 @@ import jakarta.persistence.Id;
 import jakarta.persistence.Index;
 import jakarta.persistence.PrePersist;
 import jakarta.persistence.Table;
+import jakarta.persistence.UniqueConstraint;
 import jakarta.persistence.Version;
 
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.util.Objects;
 import java.util.UUID;
 
 @Entity
-@Table(name = "payments", indexes = {
-        @Index(name = "idx_payments_status_created_at", columnList = "status, created_at")
-})
+@Table(name = "payments",
+        uniqueConstraints = @UniqueConstraint(
+                name = "uk_payments_user_id_idempotency_key", columnNames = {"user_id", "idempotency_key"}),
+        indexes = {
+                @Index(name = "idx_payments_status_created_at", columnList = "status, created_at"),
+                @Index(name = "idx_payments_user_id_created_at", columnList = "user_id, created_at")
+        })
 public class Payment {
 
     @Id
     @GeneratedValue(strategy = GenerationType.UUID)
     private UUID id;
 
-    @Column(name = "idempotency_key", nullable = false, unique = true, length = 255)
+    // Keycloak subject (jwt.sub). Nullable in the schema only for rows that
+    // predate auth; every payment created through the API has one.
+    @Column(name = "user_id", length = 36)
+    private String userId;
+
+    // Unique per user, not globally — see the table-level constraint.
+    @Column(name = "idempotency_key", nullable = false, length = 255)
     private String idempotencyKey;
 
     @Column(nullable = false, precision = 19, scale = 2)
@@ -62,7 +74,8 @@ public class Payment {
         // JPA
     }
 
-    public Payment(String idempotencyKey, BigDecimal amount, String currency) {
+    public Payment(String userId, String idempotencyKey, BigDecimal amount, String currency) {
+        this.userId = Objects.requireNonNull(userId, "userId");
         this.idempotencyKey = idempotencyKey;
         this.amount = amount;
         this.currency = currency;
@@ -78,6 +91,14 @@ public class Payment {
 
     public UUID getId() {
         return id;
+    }
+
+    public String getUserId() {
+        return userId;
+    }
+
+    public boolean isOwnedBy(String userId) {
+        return this.userId != null && this.userId.equals(userId);
     }
 
     public String getIdempotencyKey() {

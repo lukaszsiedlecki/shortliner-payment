@@ -45,13 +45,14 @@ class ReconciliationJobTest {
 
     @Test
     void resolvesStuckPaymentsUsingProviderStatus() {
-        Payment stuck = new Payment("key-1", BigDecimal.TEN, "USD");
+        Payment stuck = new Payment("user-1", "key-1", BigDecimal.TEN, "USD");
         UUID id = UUID.randomUUID();
         ReflectionTestUtils.setField(stuck, "id", id);
 
         when(paymentRepository.findByStatusAndCreatedAtBefore(eq(PaymentStatus.PENDING), any()))
                 .thenReturn(List.of(stuck));
-        when(paymentProvider.checkStatus("key-1")).thenReturn(ChargeResult.success("ref-1"));
+        // Looked up by payment ID — the key the provider was charged with.
+        when(paymentProvider.checkStatus(id.toString())).thenReturn(ChargeResult.success("ref-1"));
 
         job.reconcileStuckPayments();
 
@@ -61,11 +62,13 @@ class ReconciliationJobTest {
 
     @Test
     void leavesPaymentAloneWhenProviderHasNoRecord() {
-        Payment stuck = new Payment("key-2", BigDecimal.TEN, "USD");
+        Payment stuck = new Payment("user-1", "key-2", BigDecimal.TEN, "USD");
+        UUID id = UUID.randomUUID();
+        ReflectionTestUtils.setField(stuck, "id", id);
 
         when(paymentRepository.findByStatusAndCreatedAtBefore(eq(PaymentStatus.PENDING), any()))
                 .thenReturn(List.of(stuck));
-        when(paymentProvider.checkStatus("key-2")).thenReturn(null);
+        when(paymentProvider.checkStatus(id.toString())).thenReturn(null);
 
         job.reconcileStuckPayments();
 

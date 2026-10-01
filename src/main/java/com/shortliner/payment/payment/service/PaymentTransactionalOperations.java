@@ -52,8 +52,8 @@ class PaymentTransactionalOperations {
     }
 
     /**
-     * Idempotent receiver: attempts an insert, and on a unique-constraint
-     * conflict reads back whatever row won the race instead of charging
+     * Idempotent receiver: attempts an insert, and on a conflict on the
+     * per-user (user_id, idempotency_key) unique constraint reads back whatever row won the race instead of charging
      * again. Deliberately NOT @Transactional — {@code saveAndFlush} and
      * {@code findByIdempotencyKey} each get their own transaction from
      * Spring Data's repository proxy, which is exactly what's wanted here.
@@ -63,13 +63,16 @@ class PaymentTransactionalOperations {
      * transaction-free (and never letting a caller wrap it in one) is what
      * keeps the two DB round-trips properly isolated from each other.
      */
-    Payment getOrCreatePending(String idempotencyKey, BigDecimal amount, String currency) {
+    Payment getOrCreatePending(String userId, String idempotencyKey, BigDecimal amount, String currency) {
         try {
-            Payment payment = paymentRepository.saveAndFlush(new Payment(idempotencyKey, amount, currency));
+            Payment payment = paymentRepository.saveAndFlush(new Payment(userId, idempotencyKey, amount, currency));
             metrics.idempotencyKeySeen();
             return payment;
         } catch (DataIntegrityViolationException e) {
-            return paymentRepository.findByIdempotencyKey(idempotencyKey)
+            // Read back by both columns of the (user_id, idempotency_key)
+            // constraint: the same key under another user is a different
+            // payment and must never be returned to this caller.
+            return paymentRepository.findByUserIdAndIdempotencyKey(userId, idempotencyKey)
                     // Key deliberately left out of the message: it'd end up in
                     // the ERROR log line GlobalExceptionHandler writes.
                     .orElseThrow(() -> new IllegalStateException(
@@ -130,6 +133,7 @@ class PaymentTransactionalOperations {
     private OutboxEvent newPaymentCompletedEvent(Payment payment) {
         PaymentCompletedEvent event = new PaymentCompletedEvent(
                 payment.getId(),
+                payment.getUserId(),
                 payment.getIdempotencyKey(),
                 payment.getAmount(),
                 payment.getCurrency(),

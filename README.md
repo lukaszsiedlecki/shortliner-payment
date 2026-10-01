@@ -43,6 +43,11 @@ HIKARI_MIN_IDLE=5
 # Kafka
 KAFKA_BOOTSTRAP_SERVERS=localhost:9092
 
+# Auth (Keycloak realm "shortliner") — in the cluster, the JWKS URI must be
+# the in-cluster service (keycloak.local doesn't resolve from pods)
+KEYCLOAK_JWK_SET_URI=http://keycloak.local/realms/shortliner/protocol/openid-connect/certs
+KEYCLOAK_ISSUER_URI=http://keycloak.local/realms/shortliner
+
 # Reconciliation
 RECONCILIATION_INTERVAL_MS=30000
 RECONCILIATION_STUCK_AFTER_MS=20000
@@ -103,7 +108,7 @@ Six patterns, deliberately kept in separate, identifiable places:
 
 | # | Pattern | Where |
 |---|---|---|
-| 1 | **Idempotent Receiver** | `Payment.idempotency_key` has a DB `UNIQUE` constraint — the actual safeguard, not app-level checking. `PaymentTransactionalOperations.getOrCreatePending` attempts an insert; on conflict it reads back whichever request won the race. |
+| 1 | **Idempotent Receiver** | `(user_id, idempotency_key)` has a DB `UNIQUE` constraint (keys are scoped per user) — the actual safeguard, not app-level checking. `PaymentTransactionalOperations.getOrCreatePending` attempts an insert; on conflict it reads back whichever request won the race. |
 | 2 | **Explicit state machine** | `PaymentStatus` (PENDING → SUCCESS / FAILED) with `canTransitionTo`, enforced on every write in `PaymentTransactionalOperations.finalizePayment`. |
 | 3 | **Optimistic locking** | `@Version` on `Payment`. Two callers racing to finalize the same row (the direct charge path and the reconciliation job) — one wins, the other gets `ObjectOptimisticLockingFailureException` and reads the winner's result instead. |
 | 4 | **Transactional Outbox** | `OutboxEvent`, written in the *same* DB transaction as the SUCCESS status update (`PaymentTransactionalOperations.finalizePayment`). `OutboxPublisher` polls and publishes to Kafka separately, so an event can never be lost or published for an uncommitted charge. |
@@ -148,6 +153,7 @@ On a successful charge, a `PaymentCompleted` event is published to `shortliner.p
 ```json
 {
   "paymentId": "550e8400-e29b-41d4-a716-446655440000",
+  "userId": "f3c1a2b4-1111-2222-3333-444455556666",
   "idempotencyKey": "client-generated-key",
   "amount": 9.99,
   "currency": "USD",
@@ -155,16 +161,31 @@ On a successful charge, a `PaymentCompleted` event is published to `shortliner.p
 }
 ```
 
-`shortliner` is expected to consume this to unlock the premium plan.
+`userId` is the Keycloak subject of the payer; a consumer is expected to use it to unlock the
+premium plan for that user. `idempotencyKey` is only unique per user.
 
 ## API Reference
 
 Base URL: `http://localhost:8083`
 
+Every `/api/payments/**` endpoint requires `Authorization: Bearer <Keycloak access token>` (401
+otherwise). In the deployed system, `shortliner-gateway` relays the token; the caller's identity is
+always the token's `sub`, never anything in the request.
+
+| Endpoint | Anonymous | User | Admin |
+|---|---|---|---|
+| `POST /api/payments` | 401 | charges as themselves | same |
+| `GET /api/payments` | 401 | own payments, newest first, paged | own payments |
+| `GET /api/payments/{id}` | 401 | own only — 404 otherwise | any |
+| `POST /api/payments/_debug/**` | 401 | 403 | allowed (if `PAYMENT_DEBUG_ENABLED`) |
+| `/actuator/health/**`, `/actuator/prometheus`, Swagger | allowed | allowed | allowed |
+| other `/actuator/**` | 401 | 403 | allowed |
+
 ### Create / Charge a Payment
 
-Idempotent: retrying with the same `Idempotency-Key` returns the existing payment (PENDING or
-terminal) instead of charging again.
+Idempotent: the same user retrying with the same `Idempotency-Key` gets the existing payment
+(PENDING or terminal) instead of charging again. Keys are scoped per user — the same key from two
+different users creates two independent payments.
 
 ```
 POST /api/payments
@@ -173,6 +194,7 @@ Idempotency-Key: <client-generated key>
 
 ```bash
 curl -s -X POST http://localhost:8083/api/payments \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: $(uuidgen)" \
   -d '{"amount": 9.99, "currency": "USD"}' | jq
@@ -197,10 +219,23 @@ curl -s -X POST http://localhost:8083/api/payments \
 GET /api/payments/{id}
 ```
 
+Owner or admin only; another user's payment is a 404, so IDs can't be probed for existence.
+
+### List My Payments
+
+```
+GET /api/payments?page=0&size=20      # size 1..100
+```
+
+```json
+{ "content": [ { "id": "...", "status": "SUCCESS", ... } ],
+  "page": { "size": 20, "number": 0, "totalElements": 1, "totalPages": 1 } }
+```
+
 ### Exercising the reconciliation job by hand
 
-`POST /api/payments/_debug/simulate-stuck-payment` (disabled via `PAYMENT_DEBUG_ENABLED=false`
-outside local exploration) creates a PENDING payment and seeds the mock provider as if the charge
+`POST /api/payments/_debug/simulate-stuck-payment` (admin role required; disabled via
+`PAYMENT_DEBUG_ENABLED=false` outside local exploration) creates a PENDING payment and seeds the mock provider as if the charge
 had already succeeded there, without ever finalizing it — simulating this service crashing between
 charging and persisting. `GET` the returned id immediately (PENDING), wait past
 `RECONCILIATION_STUCK_AFTER_MS`, `GET` it again (SUCCESS).

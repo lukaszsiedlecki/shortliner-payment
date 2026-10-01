@@ -49,35 +49,36 @@ class PaymentServiceTest {
 
     @Test
     void chargesProviderOnlyForANewPendingPayment() {
-        Payment pending = new Payment("key-1", BigDecimal.TEN, "USD");
-        UUID id = UUID.randomUUID();
-        ReflectionTestUtils.setField(pending, "id", id);
+        Payment pending = paymentWithId("user-1", "key-1");
+        UUID id = pending.getId();
 
-        Payment finalized = new Payment("key-1", BigDecimal.TEN, "USD");
+        Payment finalized = new Payment("user-1", "key-1", BigDecimal.TEN, "USD");
         finalized.setStatus(PaymentStatus.SUCCESS);
 
-        when(transactionalOperations.getOrCreatePending("key-1", BigDecimal.TEN, "USD")).thenReturn(pending);
-        when(paymentProvider.charge("key-1", BigDecimal.TEN, "USD")).thenReturn(ChargeResult.success("ref-1"));
+        when(transactionalOperations.getOrCreatePending("user-1", "key-1", BigDecimal.TEN, "USD")).thenReturn(pending);
+        when(paymentProvider.charge(id.toString(), BigDecimal.TEN, "USD")).thenReturn(ChargeResult.success("ref-1"));
         when(transactionalOperations.finalizePayment(eq(id), any())).thenReturn(finalized);
 
-        Payment result = paymentService.charge("key-1", BigDecimal.TEN, "USD");
+        Payment result = paymentService.charge("user-1", "key-1", BigDecimal.TEN, "USD");
 
         assertThat(result.getStatus()).isEqualTo(PaymentStatus.SUCCESS);
         verify(metrics).chargeAttempted();
         verify(metrics).chargeCompleted(eq(ChargeOutcome.SUCCESS), any());
-        verify(paymentProvider).charge("key-1", BigDecimal.TEN, "USD");
+        // The provider is keyed by payment ID, never by the client's
+        // per-user idempotency key.
+        verify(paymentProvider).charge(id.toString(), BigDecimal.TEN, "USD");
         verify(transactionalOperations).finalizePayment(eq(id), any());
     }
 
     @Test
     void recordsProviderErrorOutcomeAndRethrows() {
-        Payment pending = new Payment("key-3", BigDecimal.TEN, "USD");
-        ReflectionTestUtils.setField(pending, "id", UUID.randomUUID());
+        Payment pending = paymentWithId("user-1", "key-3");
 
-        when(transactionalOperations.getOrCreatePending("key-3", BigDecimal.TEN, "USD")).thenReturn(pending);
-        when(paymentProvider.charge("key-3", BigDecimal.TEN, "USD")).thenThrow(new IllegalStateException("gateway down"));
+        when(transactionalOperations.getOrCreatePending("user-1", "key-3", BigDecimal.TEN, "USD")).thenReturn(pending);
+        when(paymentProvider.charge(pending.getId().toString(), BigDecimal.TEN, "USD"))
+                .thenThrow(new IllegalStateException("gateway down"));
 
-        assertThatThrownBy(() -> paymentService.charge("key-3", BigDecimal.TEN, "USD"))
+        assertThatThrownBy(() -> paymentService.charge("user-1", "key-3", BigDecimal.TEN, "USD"))
                 .isInstanceOf(IllegalStateException.class);
 
         verify(metrics).chargeCompleted(eq(ChargeOutcome.ERROR), any());
@@ -86,12 +87,12 @@ class PaymentServiceTest {
 
     @Test
     void skipsProviderCallWhenPaymentWasAlreadyResolved() {
-        Payment alreadyDone = new Payment("key-2", BigDecimal.TEN, "USD");
+        Payment alreadyDone = new Payment("user-1", "key-2", BigDecimal.TEN, "USD");
         alreadyDone.setStatus(PaymentStatus.SUCCESS);
 
-        when(transactionalOperations.getOrCreatePending("key-2", BigDecimal.TEN, "USD")).thenReturn(alreadyDone);
+        when(transactionalOperations.getOrCreatePending("user-1", "key-2", BigDecimal.TEN, "USD")).thenReturn(alreadyDone);
 
-        Payment result = paymentService.charge("key-2", BigDecimal.TEN, "USD");
+        Payment result = paymentService.charge("user-1", "key-2", BigDecimal.TEN, "USD");
 
         assertThat(result.getStatus()).isEqualTo(PaymentStatus.SUCCESS);
         verifyNoInteractions(paymentProvider);
@@ -99,10 +100,53 @@ class PaymentServiceTest {
     }
 
     @Test
-    void getByIdThrowsWhenMissing() {
+    void ownerCanReadTheirPayment() {
+        Payment payment = paymentWithId("user-1", "key-1");
+        when(paymentRepository.findById(payment.getId())).thenReturn(Optional.of(payment));
+
+        assertThat(paymentService.getForCaller(payment.getId(), "user-1", false)).isSameAs(payment);
+    }
+
+    @Test
+    void otherUsersPaymentIsReportedAsNotFound() {
+        Payment payment = paymentWithId("user-1", "key-1");
+        when(paymentRepository.findById(payment.getId())).thenReturn(Optional.of(payment));
+
+        assertThatThrownBy(() -> paymentService.getForCaller(payment.getId(), "user-2", false))
+                .isInstanceOf(PaymentNotFoundException.class);
+    }
+
+    @Test
+    void adminCanReadAnyPayment() {
+        Payment payment = paymentWithId("user-1", "key-1");
+        when(paymentRepository.findById(payment.getId())).thenReturn(Optional.of(payment));
+
+        assertThat(paymentService.getForCaller(payment.getId(), "admin-1", true)).isSameAs(payment);
+    }
+
+    @Test
+    void ownerlessHistoricalPaymentIsOnlyVisibleToAdmins() {
+        Payment legacy = paymentWithId("user-1", "key-1");
+        ReflectionTestUtils.setField(legacy, "userId", null);
+        when(paymentRepository.findById(legacy.getId())).thenReturn(Optional.of(legacy));
+
+        assertThatThrownBy(() -> paymentService.getForCaller(legacy.getId(), "user-1", false))
+                .isInstanceOf(PaymentNotFoundException.class);
+        assertThat(paymentService.getForCaller(legacy.getId(), "admin-1", true)).isSameAs(legacy);
+    }
+
+    @Test
+    void getForCallerThrowsWhenMissing() {
         UUID id = UUID.randomUUID();
         when(paymentRepository.findById(id)).thenReturn(Optional.empty());
 
-        assertThatThrownBy(() -> paymentService.getById(id)).isInstanceOf(PaymentNotFoundException.class);
+        assertThatThrownBy(() -> paymentService.getForCaller(id, "user-1", true))
+                .isInstanceOf(PaymentNotFoundException.class);
+    }
+
+    private static Payment paymentWithId(String userId, String idempotencyKey) {
+        Payment payment = new Payment(userId, idempotencyKey, BigDecimal.TEN, "USD");
+        ReflectionTestUtils.setField(payment, "id", UUID.randomUUID());
+        return payment;
     }
 }

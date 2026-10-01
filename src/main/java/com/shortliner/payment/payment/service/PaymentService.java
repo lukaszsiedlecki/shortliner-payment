@@ -10,6 +10,8 @@ import com.shortliner.payment.provider.ChargeResult;
 import com.shortliner.payment.provider.PaymentProvider;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.stereotype.Service;
 
@@ -44,10 +46,13 @@ public class PaymentService {
         this.metrics = metrics;
     }
 
-    public Payment charge(String idempotencyKey, BigDecimal amount, String currency) {
+    /**
+     * @param userId the authenticated caller (jwt.sub) — never a client-supplied value
+     */
+    public Payment charge(String userId, String idempotencyKey, BigDecimal amount, String currency) {
         metrics.chargeAttempted();
 
-        Payment payment = transactionalOperations.getOrCreatePending(idempotencyKey, amount, currency);
+        Payment payment = transactionalOperations.getOrCreatePending(userId, idempotencyKey, amount, currency);
         if (payment.getStatus() != PaymentStatus.PENDING) {
             // Idempotent replay: a previous attempt (maybe on another
             // replica) already ran this to completion. Nothing to charge.
@@ -58,14 +63,23 @@ public class PaymentService {
             return payment;
         }
 
-        ChargeResult result = chargeProvider(idempotencyKey, amount, currency);
+        ChargeResult result = chargeProvider(payment);
         return finalizePayment(payment.getId(), result);
     }
 
-    private ChargeResult chargeProvider(String idempotencyKey, BigDecimal amount, String currency) {
+    /**
+     * The provider's idempotency key is the payment ID, not the client's
+     * key. Client keys are only unique per user, while a gateway scopes keys
+     * to our whole merchant account — passing them through would let two
+     * users with the same key collide at the provider (the second would get
+     * the first's result). The payment ID is just as stable across retries:
+     * a retry with the same (user, key) reads back the same row.
+     */
+    private ChargeResult chargeProvider(Payment payment) {
         long start = System.nanoTime();
         try {
-            ChargeResult result = paymentProvider.charge(idempotencyKey, amount, currency);
+            ChargeResult result = paymentProvider.charge(
+                    payment.getId().toString(), payment.getAmount(), payment.getCurrency());
             metrics.chargeCompleted(ChargeOutcome.of(result), Duration.ofNanos(System.nanoTime() - start));
             return result;
         } catch (RuntimeException e) {
@@ -74,8 +88,18 @@ public class PaymentService {
         }
     }
 
-    public Payment getById(UUID id) {
-        return paymentRepository.findById(id).orElseThrow(() -> new PaymentNotFoundException(id));
+    /**
+     * Another user's payment is reported as not found rather than forbidden,
+     * so payment IDs can't be probed for existence. Admins can read any.
+     */
+    public Payment getForCaller(UUID id, String callerUserId, boolean callerIsAdmin) {
+        return paymentRepository.findById(id)
+                .filter(payment -> callerIsAdmin || payment.isOwnedBy(callerUserId))
+                .orElseThrow(() -> new PaymentNotFoundException(id));
+    }
+
+    public Page<Payment> listForUser(String userId, int page, int size) {
+        return paymentRepository.findByUserIdOrderByCreatedAtDesc(userId, PageRequest.of(page, size));
     }
 
     /**

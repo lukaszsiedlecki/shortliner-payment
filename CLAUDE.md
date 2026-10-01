@@ -41,11 +41,22 @@ Learning microservice in the Shortliner system: handles premium-plan payments, r
 Kafka/Prometheus/Grafana stack. Full pattern-by-pattern breakdown is in README.md's Architecture
 section — this is the condensed version:
 
+**Auth** (`SecurityConfig`): OAuth2 resource server for Keycloak tokens relayed by
+`shortliner-gateway`. Every `/api/payments/**` endpoint is authenticated; `_debug/**` needs
+`ROLE_admin` (mapped from `realm_access.roles`). User ID is always `jwt.getSubject()`. Rules are URL
+rules, not `@PreAuthorize` — an `AccessDeniedException` from inside a controller would hit
+`GlobalExceptionHandler`'s catch-all and become a 500. `JwtDecoder` is built from the JWKS URI (not
+`issuer-uri`), fetched lazily, so tests and startup don't need Keycloak; WebMvc tests
+`@Import(SecurityConfig.class)` and use `spring-security-test`'s `jwt()`, the IT mocks `JwtDecoder`.
+
 **Charge flow** (`PaymentController` → `PaymentService` → `PaymentTransactionalOperations`):
-1. `getOrCreatePending` attempts an insert; a unique-constraint conflict on `idempotency_key` means
-   another request (any replica) already owns this key, so it reads that row back instead.
+1. `getOrCreatePending` attempts an insert; a conflict on the `(user_id, idempotency_key)` unique
+   constraint means another request (any replica) already owns this key *for this user*, so it reads
+   that row back by both columns instead.
 2. If the row is fresh PENDING, `PaymentProvider.charge` (mocked) is called *outside* any DB
-   transaction — a DB transaction must never span an external call.
+   transaction — a DB transaction must never span an external call. The provider's idempotency key
+   is the **payment ID**, not the client's key: client keys are only unique per user, while a
+   gateway scopes keys to the whole merchant account. Reconciliation's `checkStatus` uses it too.
 3. `finalizePayment` validates the state transition, writes the terminal status, and — only on
    SUCCESS — an `OutboxEvent`, all in one commit (transactional outbox). `@Version` guards it against
    a concurrent finalize (e.g. the reconciliation job resolving the same row at the same time).

@@ -1,5 +1,6 @@
 package com.shortliner.payment.payment.exception;
 
+import jakarta.validation.ConstraintViolationException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
@@ -12,6 +13,7 @@ import org.springframework.web.bind.MissingRequestHeaderException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.method.annotation.HandlerMethodValidationException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 @RestControllerAdvice
@@ -35,7 +37,8 @@ public class GlobalExceptionHandler {
         return problem;
     }
 
-    @ExceptionHandler({MethodArgumentNotValidException.class, MissingRequestHeaderException.class})
+    @ExceptionHandler({MethodArgumentNotValidException.class, MissingRequestHeaderException.class,
+            ConstraintViolationException.class, HandlerMethodValidationException.class})
     public ProblemDetail handleBadRequest(Exception ex) {
         ProblemDetail problem = ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, ex.getMessage());
         problem.setTitle("Invalid Request");
