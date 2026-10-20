@@ -1,6 +1,6 @@
 package com.shortliner.payment.payment.service;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
+import tools.jackson.databind.ObjectMapper;
 import com.shortliner.payment.metrics.PaymentMetrics;
 import com.shortliner.payment.outbox.PaymentCompletedEvent;
 import com.shortliner.payment.outbox.entity.OutboxEvent;
