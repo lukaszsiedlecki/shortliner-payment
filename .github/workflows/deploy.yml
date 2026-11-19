@@ -62,6 +62,9 @@ jobs:
     # Federation, gated by this repo's own "production" environment
     # (required reviewer) — same pattern as shortliner-analytics.
     needs: build-and-push
+    # Parked: a run nobody approves fails after 30 days and sends a failure email.
+    # To deploy to GCP again, set the repo variable GKE_DEPLOY=true (Settings → Variables).
+    if: vars.GKE_DEPLOY == 'true'
     runs-on: ubuntu-latest
     environment: production
     permissions:
